@@ -39,3 +39,5 @@ from .ring_flash_attn_symm import (
     # ring_flash_attn_symm_kvpacked_func,
     # ring_flash_attn_symm_qkvpacked_func,
 )
+
+from .ring_flash_attn_symm_direct import ring_flash_attn_symm_direct_func

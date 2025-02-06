@@ -201,6 +201,7 @@ class RingCommSymm:
     def sync(self):
         self.stream[0].wait_stream(self.stream[1]) # wait for the backend stream to finish
 
+
     def step(self):
         # with torch.cuda.stream(self.stream[0]):
         #     self.k_hdl[0].barrier()
@@ -231,3 +232,47 @@ class AllGatherComm:
         for handle in self.handles:
             handle.wait()
         self.handles = []
+
+class RingCommSymmDirect:
+    def __init__(
+        self, 
+        process_group: dist.ProcessGroup, 
+        k: torch.Tensor, 
+        v: torch.Tensor, 
+        k_hdl: symm_mem._SymmetricMemory,
+        v_hdl: symm_mem._SymmetricMemory
+    ):
+        self._process_group = process_group
+        self.rank = dist.get_rank(self._process_group)
+        self.world_size = dist.get_world_size(self._process_group)
+
+        self.k = k
+        self.v = v
+        self.k_hdl = k_hdl
+        self.v_hdl = v_hdl
+        self.stream = torch.cuda.current_stream(), symm_mem._get_backend_stream()
+        self.stream[1].wait_stream(self.stream[0]) # initialize the backend stream
+        self.stream_id = 0
+
+
+    def send_recv(
+        self, target: torch.Tensor, handle: symm_mem._SymmetricMemory, stream: torch.Stream, round: int
+    )-> torch.Tensor:
+        with torch.cuda.stream(stream):
+            src_rank = (self.rank - round) % self.world_size
+            src = handle.get_buffer(src_rank, target.shape, target.dtype)
+            ret = torch.empty_like(target)
+            ret.copy_(src)
+            return ret
+            
+
+    def sync(self):
+        self.stream[0].wait_stream(self.stream[1]) # wait for the backend stream to finish
+
+    def step(self):
+        self.stream_id = self.stream_id^1
+
+    def send_recv_kv(self, round: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        this_k = self.send_recv(self.k, self.k_hdl, self.stream[self.stream_id], round)
+        this_v = self.send_recv(self.v, self.v_hdl, self.stream[self.stream_id], round)
+        return this_k, this_v

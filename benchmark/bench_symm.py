@@ -8,6 +8,7 @@ from ring_flash_attn import (
     zigzag_ring_flash_attn_func,
     stripe_flash_attn_func,
     ring_flash_attn_symm_func,
+    ring_flash_attn_symm_direct_func
 )
 
 
@@ -75,7 +76,14 @@ def benchmark(f, num_iter=100, forward_only=True, log=True, profile=False):
 
         k_hdl_list = [symm_mem.rendezvous(local_k_list[i], dist.group.WORLD) for i in range(3)]
         v_hdl_list = [symm_mem.rendezvous(local_v_list[i], dist.group.WORLD) for i in range(3)]
-
+    elif f == ring_flash_attn_symm_direct_func:
+        local_k = symm_mem.empty(k_t.shape, dtype=dtype, device=device)
+        local_v = symm_mem.empty(v_t.shape, dtype=dtype, device=device)
+        local_k.copy_(k_t)
+        local_v.copy_(v_t)
+        
+        k_hdl = symm_mem.rendezvous(local_k, dist.group.WORLD)
+        v_hdl = symm_mem.rendezvous(local_v, dist.group.WORLD)
     else:
         k = k_t
         v = v_t
@@ -123,6 +131,19 @@ def benchmark(f, num_iter=100, forward_only=True, log=True, profile=False):
                         local_v_list,
                         k_hdl_list,
                         v_hdl_list,
+                        causal=causal,
+                        window_size=(-1, -1),
+                        alibi_slopes=None,
+                        deterministic=deterministic,
+                        return_attn_probs=False,
+                    )
+                elif f == ring_flash_attn_symm_direct_func:
+                    _ = f(
+                        q,
+                        local_k,
+                        local_v,
+                        k_hdl,
+                        v_hdl,
                         causal=causal,
                         window_size=(-1, -1),
                         alibi_slopes=None,
@@ -179,13 +200,14 @@ if __name__ == "__main__":
     rank = dist.get_rank()
 
     forward_only = True
-    profile = True
-    num_iter = 1 if forward_only else 100
+    profile = False
+    num_iter = 100 if forward_only else 100
 
     for f in [
         flash_attn_func,
         ring_flash_attn_func,
-        ring_flash_attn_symm_func,
+        ring_flash_attn_symm_direct_func
+        # ring_flash_attn_symm_func,
         # zigzag_ring_flash_attn_func,
         # stripe_flash_attn_func,
     ]:
