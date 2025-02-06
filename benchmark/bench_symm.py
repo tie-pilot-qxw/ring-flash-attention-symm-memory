@@ -180,7 +180,7 @@ if __name__ == "__main__":
 
     forward_only = True
     profile = True
-    num_iter = 2 if forward_only else 100
+    num_iter = 1 if forward_only else 100
 
     for f in [
         flash_attn_func,

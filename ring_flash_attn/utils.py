@@ -189,23 +189,25 @@ class RingCommSymm:
             else:
                 hdl = handle[comm]
                 # dist.barrier()
-                # hdl.wait_signal(self.recv_rank, self.recv_rank) # wait for the other side to finish the transfer
+                hdl.wait_signal(self.recv_rank) # wait for the other side to finish the transfer
+                hdl.wait_signal(self.send_rank) # wait for the other side to finish the transfer
                 
             src = hdl.get_buffer(self.recv_rank, target.shape, target.dtype)
             target.copy_(src)
-            # handle[comm].put_signal(self.send_rank, self.rank) # signal the other side that the data is ready
+            handle[comm].put_signal(self.send_rank) # signal the other side that the data is ready
+            handle[comm].put_signal(self.recv_rank) # signal the other side that the data is used
             
 
     def sync(self):
         self.stream[0].wait_stream(self.stream[1]) # wait for the backend stream to finish
 
     def step(self):
-        with torch.cuda.stream(self.stream[0]):
-            self.k_hdl[0].barrier()
-            self.v_hdl[0].barrier()
-        with torch.cuda.stream(self.stream[1]):
-            self.k_hdl[1].barrier()
-            self.v_hdl[1].barrier()
+        # with torch.cuda.stream(self.stream[0]):
+        #     self.k_hdl[0].barrier()
+        #     self.v_hdl[0].barrier()
+        # with torch.cuda.stream(self.stream[1]):
+        #     self.k_hdl[1].barrier()
+        #     self.v_hdl[1].barrier()
         self.compute = self.compute^1
 
     def send_recv_kv(self, round: int):
