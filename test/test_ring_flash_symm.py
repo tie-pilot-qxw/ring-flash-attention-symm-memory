@@ -19,7 +19,7 @@ if __name__ == "__main__":
     nheads = 5
     d = 128
     dropout_p = 0
-    causal = True
+    causal = False
     deterministic = False
 
     assert seqlen % world_size == 0
@@ -41,12 +41,25 @@ if __name__ == "__main__":
     local_v = symm_mem.empty(tmp_qkv[:, :, 2].shape, dtype=dtype, device=device)
     local_k.copy_(tmp_qkv[:, :, 1])
     local_v.copy_(tmp_qkv[:, :, 2])
+
+    local_k_list = []
+    local_v_list = []
+
+    local_k_list.append(symm_mem.empty(local_k.shape, dtype=dtype, device=device))
+    local_v_list.append(symm_mem.empty(local_v.shape, dtype=dtype, device=device))
+    local_k_list.append(symm_mem.empty(local_k.shape, dtype=dtype, device=device))
+    local_v_list.append(symm_mem.empty(local_v.shape, dtype=dtype, device=device))
+    local_k_list.append(local_k)
+    local_v_list.append(local_v)
+
+    k_hdl_list = [symm_mem.rendezvous(local_k_list[i], dist.group.WORLD) for i in range(3)]
+    v_hdl_list = [symm_mem.rendezvous(local_v_list[i], dist.group.WORLD) for i in range(3)]
+
+    for k, v in zip(local_k_list, local_v_list):
+        k.requires_grad = True
+        v.requires_grad = True
     
     local_q.requires_grad = True
-    local_k.requires_grad = True
-    local_v.requires_grad = True
-
-    local_kv = torch.stack((local_k, local_v), dim=2)
 
     local_dout = dout.chunk(world_size, dim=1)[rank].detach().clone()
 
@@ -73,8 +86,10 @@ if __name__ == "__main__":
 
     ring_out, ring_lse, _ = fn(
         local_q,
-        local_k,
-        local_v,
+        local_k_list,
+        local_v_list,
+        k_hdl_list,
+        v_hdl_list,
         dropout_p=dropout_p,
         causal=causal,
         window_size=(-1, -1),
@@ -90,19 +105,20 @@ if __name__ == "__main__":
     log("lse diff", local_lse - ring_lse)
 
     dist.barrier()
-    if rank == 0:
-        print("#" * 30)
-        print("# backward:")
-        print("#" * 30)
+    
+    # if rank == 0:
+    #     print("#" * 30)
+    #     print("# backward:")
+    #     print("#" * 30)
 
-    out.backward(dout)
-    dqkv = qkv.grad
-    local_dqkv = dqkv.chunk(world_size, dim=1)[rank]
+    # out.backward(dout)
+    # dqkv = qkv.grad
+    # local_dqkv = dqkv.chunk(world_size, dim=1)[rank]
 
-    ring_out.backward(local_dout)
-    ring_dqkv = torch.stack((local_q.grad, local_k.grad, local_v.grad), dim=2)
+    # ring_out.backward(local_dout)
+    # ring_dqkv = torch.stack((local_q.grad, local_k.grad, local_v.grad), dim=2)
 
-    log("local_dqkv", local_dqkv)
-    log("dq diff", local_dqkv[:, 0] - ring_dqkv[:, 0])
-    log("dk diff", local_dqkv[:, 1] - ring_dqkv[:, 1])
-    log("dv diff", local_dqkv[:, 2] - ring_dqkv[:, 2])
+    # log("local_dqkv", local_dqkv)
+    # log("dq diff", local_dqkv[:, 0] - ring_dqkv[:, 0])
+    # log("dk diff", local_dqkv[:, 1] - ring_dqkv[:, 1])
+    # log("dv diff", local_dqkv[:, 2] - ring_dqkv[:, 2])

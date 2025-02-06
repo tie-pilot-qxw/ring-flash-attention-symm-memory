@@ -1,16 +1,43 @@
+from typing import List, Tuple
 import torch
 import torch.distributed as dist
 from flash_attn.flash_attn_interface import _flash_attn_forward, _flash_attn_backward
-from .utils import RingCommSymm, update_out_and_lse, get_default_args
+from .utils import RingCommSymm, RingComm, update_out_and_lse, get_default_args
 import torch.distributed._symmetric_memory as symm_mem
 from torch.distributed._symmetric_memory import _SymmetricMemory
 
+# def log(msg, a, rank0_only=False):
+#     world_size = dist.get_world_size()
+#     rank = dist.get_rank()
+#     if rank0_only:
+#         if rank == 0:
+#             print(
+#                 f"{msg}: "
+#                 f"max {a.abs().max().item():.3g}, "
+#                 f"mean {a.abs().mean().item():.3g}",
+#                 flush=True,
+#             )
+#         return
+
+#     for i in range(world_size):
+#         if i == rank:
+#             if rank == 0:
+#                 print(f"{msg}:")
+#             print(
+#                 f"[{rank}] "
+#                 f"max {a.abs().max().item():.3g}, "
+#                 f"mean {a.abs().mean().item():.3g}",
+#                 flush=True,
+#             )
+#         dist.barrier()
 
 def ring_flash_attn_symm_forward(
     process_group,
     q: torch.Tensor, 
-    k: torch.Tensor, # must be symmetric memory
-    v: torch.Tensor, # must be symmetric memory
+    k: List[torch.Tensor], # must be symmetric memory
+    v: List[torch.Tensor], # must be symmetric memory
+    k_hdl: List[_SymmetricMemory],
+    v_hdl: List[_SymmetricMemory],
     softmax_scale,
     dropout_p=0,
     causal=True,
@@ -18,66 +45,63 @@ def ring_flash_attn_symm_forward(
     alibi_slopes=None,
     deterministic=False,
 ):
-    comm = RingCommSymm(process_group)
-
-    handle_k = symm_mem.rendezvous(k, process_group)
-    handle_v = symm_mem.rendezvous(v, process_group)
-    assert handle_k is not None
-    assert handle_v is not None
-
-    next_k = symm_mem.empty(k.shape, dtype=k.dtype, device=k.device)
-    next_v = symm_mem.empty(v.shape, dtype=v.dtype, device=v.device)
-
-    next_handle_k = symm_mem.rendezvous(next_k, process_group)
-    next_handle_v = symm_mem.rendezvous(next_v, process_group)
-    assert next_handle_k is not None
-    assert next_handle_v is not None
+    comm = RingCommSymm(process_group, k, v, k_hdl, v_hdl)
+    # comm_truth = RingComm(process_group)
 
     out = None
     lse = None
 
+    # k_truth, v_truth = k[2], v[2]
+
     for step in range(comm.world_size):
         if step + 1 != comm.world_size:
-            next_k, next_v = comm.send_recv_kv(k, v, next_k, next_v, handle_k, handle_v)
+            comm.send_recv_kv(step)
+            # next_k, next_v = comm_truth.send_recv_kv(k_truth, v_truth)
 
-        if not causal or step <= comm.rank:
-            params = get_default_args(_flash_attn_forward).copy()
-            params.update(
-                {
-                    "q": q,
-                    "k": k,
-                    "v": v,
-                    "dropout_p": dropout_p,
-                    "softmax_scale": softmax_scale,
-                    "causal": causal and step == 0,
-                    "alibi_slopes": alibi_slopes,
-                    "return_softmax": True and dropout_p > 0,
-                }
-            )
-            if "window_size" in params:
-                params.update({"window_size": window_size})
+        with torch.cuda.stream(comm.stream[comm.compute]):
+            if step == 0:
+                k, v = comm.k[2], comm.v[2]
             else:
+                k, v = comm.k[comm.compute], comm.v[comm.compute]
+
+            # log("diff k", k - k_truth)
+            # log("diff v", v - v_truth)
+            if not causal or step <= comm.rank:
+                params = get_default_args(_flash_attn_forward).copy()
                 params.update(
                     {
-                        "window_size_left": window_size[0],
-                        "window_size_right": window_size[1],
+                        "q": q,
+                        "k": k,
+                        "v": v,
+                        "dropout_p": dropout_p,
+                        "softmax_scale": softmax_scale,
+                        "causal": causal and step == 0,
+                        "alibi_slopes": alibi_slopes,
+                        "return_softmax": True and dropout_p > 0,
                     }
                 )
-            outputs = _flash_attn_forward(**params)
-            if len(outputs) == 8:
-                block_out, _, _, _, _, block_lse, _, _ = outputs
-            else:
-                assert len(outputs) == 4
-                block_out, block_lse, _, _ = outputs
-            out, lse = update_out_and_lse(out, lse, block_out, block_lse)
+                if "window_size" in params:
+                    params.update({"window_size": window_size})
+                else:
+                    params.update(
+                        {
+                            "window_size_left": window_size[0],
+                            "window_size_right": window_size[1],
+                        }
+                    )
+                outputs = _flash_attn_forward(**params)
+                if len(outputs) == 8:
+                    block_out, _, _, _, _, block_lse, _, _ = outputs
+                else:
+                    assert len(outputs) == 4
+                    block_out, block_lse, _, _ = outputs
+                out, lse = update_out_and_lse(out, lse, block_out, block_lse)
+        comm.step()
+        # if step + 1 != comm.world_size:
+        #     comm_truth.wait()
+        #     k_truth, v_truth = next_k, next_v
 
-        if step + 1 != comm.world_size:
-            comm.wait(handle_k, handle_v)
-            handle_k, next_handle_k = next_handle_k, handle_k
-            handle_v, next_handle_v = next_handle_v, handle_v
-            k, next_k = next_k, k
-            v, next_v = next_v, v
-
+    comm.sync()
     out = out.to(q.dtype)
     lse = lse.squeeze(dim=-1).transpose(1, 2)
     return out, lse
@@ -215,6 +239,8 @@ class RingFlashAttnSymmFunc(torch.autograd.Function):
         q,
         k,
         v,
+        k_hdl,
+        v_hdl,
         dropout_p,
         softmax_scale,
         causal,
@@ -228,13 +254,16 @@ class RingFlashAttnSymmFunc(torch.autograd.Function):
             softmax_scale = q.shape[-1] ** (-0.5)
 
         assert alibi_slopes is None
-        k = k.contiguous()
-        v = v.contiguous()
+        assert k[2].is_contiguous()
+        assert v[2].is_contiguous()
+
         out, softmax_lse = ring_flash_attn_symm_forward(
             group,
             q,
             k,
             v,
+            k_hdl,
+            v_hdl,
             softmax_scale=softmax_scale,
             dropout_p=dropout_p,
             causal=causal,
@@ -243,7 +272,15 @@ class RingFlashAttnSymmFunc(torch.autograd.Function):
             deterministic=False,
         )
         # this should be out_padded
-        ctx.save_for_backward(q, k, v, out, softmax_lse)
+        ctx.save_for_backward(
+            q,
+            k[0], k[1], k[2], 
+            v[0], v[1], v[2],
+            out, softmax_lse
+        )
+        ctx.k_hdl = k_hdl
+        ctx.v_hdl = v_hdl
+        ctx.buffer = [k[0], k[1], v[0], v[1]]
         ctx.dropout_p = dropout_p
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
@@ -331,6 +368,8 @@ def ring_flash_attn_symm_func(
     q,
     k,
     v,
+    k_hdl,
+    v_hdl,
     dropout_p=0.0,
     softmax_scale=None,
     causal=False,
@@ -346,6 +385,8 @@ def ring_flash_attn_symm_func(
         q,
         k,
         v,
+        k_hdl,
+        v_hdl,
         dropout_p,
         softmax_scale,
         causal,

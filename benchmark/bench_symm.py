@@ -58,10 +58,24 @@ def benchmark(f, num_iter=100, forward_only=True, log=True, profile=False):
         requires_grad=True,
     )
     if f == ring_flash_attn_symm_func:
-        k = symm_mem.empty(k_t.shape, dtype=dtype, device=device)
-        v = symm_mem.empty(v_t.shape, dtype=dtype, device=device)
-        k.copy_(k_t)
-        v.copy_(v_t)
+        local_k = symm_mem.empty(k_t.shape, dtype=dtype, device=device)
+        local_v = symm_mem.empty(v_t.shape, dtype=dtype, device=device)
+        local_k.copy_(k_t)
+        local_v.copy_(v_t)
+
+        local_k_list = []
+        local_v_list = []
+
+        local_k_list.append(symm_mem.empty(local_k.shape, dtype=dtype, device=device))
+        local_v_list.append(symm_mem.empty(local_v.shape, dtype=dtype, device=device))
+        local_k_list.append(symm_mem.empty(local_k.shape, dtype=dtype, device=device))
+        local_v_list.append(symm_mem.empty(local_v.shape, dtype=dtype, device=device))
+        local_k_list.append(local_k)
+        local_v_list.append(local_v)
+
+        k_hdl_list = [symm_mem.rendezvous(local_k_list[i], dist.group.WORLD) for i in range(3)]
+        v_hdl_list = [symm_mem.rendezvous(local_v_list[i], dist.group.WORLD) for i in range(3)]
+
     else:
         k = k_t
         v = v_t
@@ -102,16 +116,30 @@ def benchmark(f, num_iter=100, forward_only=True, log=True, profile=False):
     if forward_only:
         with torch.no_grad():
             for _ in range(num_iter):
-                _ = f(
-                    q,
-                    k,
-                    v,
-                    causal=causal,
-                    window_size=(-1, -1),
-                    alibi_slopes=None,
-                    deterministic=deterministic,
-                    return_attn_probs=False,
-                )
+                if f == ring_flash_attn_symm_func:
+                    _ = f(
+                        q,
+                        local_k_list,
+                        local_v_list,
+                        k_hdl_list,
+                        v_hdl_list,
+                        causal=causal,
+                        window_size=(-1, -1),
+                        alibi_slopes=None,
+                        deterministic=deterministic,
+                        return_attn_probs=False,
+                    )
+                else:
+                    _ = f(
+                        q,
+                        k,
+                        v,
+                        causal=causal,
+                        window_size=(-1, -1),
+                        alibi_slopes=None,
+                        deterministic=deterministic,
+                        return_attn_probs=False,
+                    )
                 if profile:
                     profiler.step()
 
@@ -151,15 +179,15 @@ if __name__ == "__main__":
     rank = dist.get_rank()
 
     forward_only = True
-    profile = False
-    num_iter = 10 if forward_only else 100
+    profile = True
+    num_iter = 2 if forward_only else 100
 
     for f in [
         flash_attn_func,
         ring_flash_attn_func,
         ring_flash_attn_symm_func,
-        zigzag_ring_flash_attn_func,
-        stripe_flash_attn_func,
+        # zigzag_ring_flash_attn_func,
+        # stripe_flash_attn_func,
     ]:
         torch.cuda.empty_cache()
         if rank == 0:

@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -152,10 +152,25 @@ class RingComm:
         return next_k, next_v
 
 class RingCommSymm:
-    def __init__(self, process_group: dist.ProcessGroup):
+    def __init__(
+        self, 
+        process_group: dist.ProcessGroup, 
+        k: List[torch.Tensor], 
+        v: List[torch.Tensor], 
+        k_hdl: List[symm_mem._SymmetricMemory],
+        v_hdl: List[symm_mem._SymmetricMemory]
+    ):
         self._process_group = process_group
         self.rank = dist.get_rank(self._process_group)
         self.world_size = dist.get_world_size(self._process_group)
+
+        self.k = k
+        self.v = v
+        self.k_hdl = k_hdl
+        self.v_hdl = v_hdl
+        self.stream = torch.cuda.current_stream(), symm_mem._get_backend_stream()
+        self.stream[1].wait_stream(self.stream[0]) # initialize the backend stream
+        self.compute = 0 if self.rank %2 == 0 else 1
 
         self.send_rank = (self.rank + 1) % self.world_size
         self.recv_rank = (self.rank - 1) % self.world_size
@@ -164,48 +179,40 @@ class RingCommSymm:
             self.send_rank = dist.get_global_rank(self._process_group, self.send_rank)
             self.recv_rank = dist.get_global_rank(self._process_group, self.recv_rank)
 
+
     def send_recv(
-        self, to_send: torch.Tensor, recv_tensor: torch.Tensor, handle: symm_mem._SymmetricMemory
-    ) -> torch.Tensor:
-        res = recv_tensor
+        self, target: torch.Tensor, handle: List[symm_mem._SymmetricMemory], stream: torch.Stream, round: int, comm: int
+    ):
+        with torch.cuda.stream(stream):
+            if round == 0:
+                hdl = handle[2] # at round 0, all the data are on buffer 2
+            else:
+                hdl = handle[comm]
+                # dist.barrier()
+                # hdl.wait_signal(self.recv_rank, self.recv_rank) # wait for the other side to finish the transfer
+                
+            src = hdl.get_buffer(self.recv_rank, target.shape, target.dtype)
+            target.copy_(src)
+            # handle[comm].put_signal(self.send_rank, self.rank) # signal the other side that the data is ready
+            
 
-        src_buf = handle.get_buffer(self.recv_rank, to_send.shape, recv_tensor.dtype)
+    def sync(self):
+        self.stream[0].wait_stream(self.stream[1]) # wait for the backend stream to finish
 
-        res.copy_(src_buf)
-        # send_op = dist.P2POp(
-        #     dist.isend, to_send, self.send_rank, group=self._process_group
-        # )
-        # recv_op = dist.P2POp(dist.irecv, res, self.recv_rank, group=self._process_group)
-        # self._ops.append(send_op)
-        # self._ops.append(recv_op)
-        return res
+    def step(self):
+        with torch.cuda.stream(self.stream[0]):
+            self.k_hdl[0].barrier()
+            self.v_hdl[0].barrier()
+        with torch.cuda.stream(self.stream[1]):
+            self.k_hdl[1].barrier()
+            self.v_hdl[1].barrier()
+        self.compute = self.compute^1
 
-    # def commit(self):
-    #     if self._reqs is not None:
-    #         raise RuntimeError("commit called twice")
-    #     self._reqs = dist.batch_isend_irecv(self._ops)
-
-    def wait(self, handle_k: symm_mem._SymmetricMemory, handle_v: symm_mem._SymmetricMemory):
-        handle_k.barrier()
-        handle_v.barrier()
-        # if self._reqs is None:
-        #     raise RuntimeError("wait called before commit")
-        # for req in self._reqs:
-        #     req.wait()
-        # self._reqs = None
-        # self._ops = []
-
-    def send_recv_kv(
-        self,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        k_buffer: torch.Tensor,
-        v_buffer: torch.Tensor,
-        handle_k: symm_mem._SymmetricMemory,
-        handle_v: symm_mem._SymmetricMemory
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        next_k, next_v = self.send_recv(k, k_buffer, handle_k), self.send_recv(v, v_buffer, handle_v)
-        return next_k, next_v
+    def send_recv_kv(self, round: int):
+        comm = self.compute^1
+        compute = self.compute
+        self.send_recv(self.k[comm], self.k_hdl, self.stream[comm], round, comm)
+        self.send_recv(self.v[comm], self.v_hdl, self.stream[comm], round, comm)
 
 class AllGatherComm:
     def __init__(self, group=None) -> None:
