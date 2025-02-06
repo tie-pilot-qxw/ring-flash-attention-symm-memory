@@ -33,3 +33,9 @@ from .adapters import (
     substitute_hf_flash_attn,
     update_ring_flash_attn_params,
 )
+
+from .ring_flash_attn_symm import (
+    ring_flash_attn_symm_func,
+    # ring_flash_attn_symm_kvpacked_func,
+    # ring_flash_attn_symm_qkvpacked_func,
+)
