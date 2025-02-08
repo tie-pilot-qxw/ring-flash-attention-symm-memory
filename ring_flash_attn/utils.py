@@ -181,7 +181,7 @@ class RingCommSymm:
 
 
     def send_recv(
-        self, target: torch.Tensor, handle: List[symm_mem._SymmetricMemory], stream: torch.Stream, round: int, comm: int
+        self, target: torch.Tensor, handle: List[symm_mem._SymmetricMemory], stream: torch.Stream, round: int, comm: int, next: bool
     ):
         with torch.cuda.stream(stream):
             if round == 0:
@@ -194,9 +194,10 @@ class RingCommSymm:
                 
             src = hdl.get_buffer(self.recv_rank, target.shape, target.dtype)
             target.copy_(src)
-            handle[comm].put_signal(self.send_rank) # signal the other side that the data is ready
-            handle[comm].put_signal(self.recv_rank) # signal the other side that the data is used
-            
+            if next:
+                handle[comm].put_signal(self.send_rank) # signal the other side that the data is ready
+                handle[comm].put_signal(self.recv_rank) # signal the other side that the data is used
+                
 
     def sync(self):
         self.stream[0].wait_stream(self.stream[1]) # wait for the backend stream to finish
@@ -211,11 +212,11 @@ class RingCommSymm:
         #     self.v_hdl[1].barrier()
         self.compute = self.compute^1
 
-    def send_recv_kv(self, round: int):
+    def send_recv_kv(self, round: int, next: bool):
         comm = self.compute^1
         compute = self.compute
-        self.send_recv(self.k[comm], self.k_hdl, self.stream[comm], round, comm)
-        self.send_recv(self.v[comm], self.v_hdl, self.stream[comm], round, comm)
+        self.send_recv(self.k[comm], self.k_hdl, self.stream[comm], round, comm, next)
+        self.send_recv(self.v[comm], self.v_hdl, self.stream[comm], round, comm, next)
 
 class AllGatherComm:
     def __init__(self, group=None) -> None:

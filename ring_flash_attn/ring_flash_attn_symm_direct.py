@@ -48,7 +48,6 @@ def ring_flash_attn_symm_direct_forward(
     comm = RingCommSymmDirect(process_group, k, v, k_hdl, v_hdl)
     # comm_truth = RingComm(process_group)
     k_hdl.barrier()
-    v_hdl.barrier()
     out = None
     lse = None
 
@@ -99,7 +98,6 @@ def ring_flash_attn_symm_direct_forward(
     out = out.to(q.dtype)
     lse = lse.squeeze(dim=-1).transpose(1, 2)
     k_hdl.barrier()
-    v_hdl.barrier()
     return out, lse
 
 

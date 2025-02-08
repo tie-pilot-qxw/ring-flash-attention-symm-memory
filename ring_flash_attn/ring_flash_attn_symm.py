@@ -45,6 +45,7 @@ def ring_flash_attn_symm_forward(
     alibi_slopes=None,
     deterministic=False,
 ):
+    k_hdl[0].barrier()
     comm = RingCommSymm(process_group, k, v, k_hdl, v_hdl)
     # comm_truth = RingComm(process_group)
 
@@ -55,7 +56,7 @@ def ring_flash_attn_symm_forward(
 
     for step in range(comm.world_size):
         if step + 1 != comm.world_size:
-            comm.send_recv_kv(step)
+            comm.send_recv_kv(step, step + 2 != comm.world_size)
             # next_k, next_v = comm_truth.send_recv_kv(k_truth, v_truth)
 
         with torch.cuda.stream(comm.stream[comm.compute]):
@@ -104,6 +105,7 @@ def ring_flash_attn_symm_forward(
     comm.sync()
     out = out.to(q.dtype)
     lse = lse.squeeze(dim=-1).transpose(1, 2)
+    k_hdl[0].barrier()
     return out, lse
 
 

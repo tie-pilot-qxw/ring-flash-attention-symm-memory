@@ -201,15 +201,15 @@ if __name__ == "__main__":
 
     forward_only = True
     profile = False
-    num_iter = 100 if forward_only else 100
+    num_iter = 500 if forward_only else 100
 
     for f in [
         flash_attn_func,
         ring_flash_attn_func,
-        ring_flash_attn_symm_direct_func
-        # ring_flash_attn_symm_func,
-        # zigzag_ring_flash_attn_func,
-        # stripe_flash_attn_func,
+        ring_flash_attn_symm_direct_func,
+        ring_flash_attn_symm_func,
+        zigzag_ring_flash_attn_func,
+        stripe_flash_attn_func,
     ]:
         torch.cuda.empty_cache()
         if rank == 0:
